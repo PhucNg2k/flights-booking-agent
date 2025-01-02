@@ -14,7 +14,8 @@ import prompts
 from llama_index.llms.openai import OpenAI
 from datetime import datetime
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict
+
 from llama_index.core.workflow import (
     StartEvent,
     StopEvent,
@@ -25,6 +26,9 @@ from llama_index.core.workflow import (
     draw_all_possible_flows,
     WorkflowCheckpointer
 )
+
+
+
 import utils
 import dateparser
 from llama_index.core.tools import FunctionTool
@@ -36,6 +40,13 @@ from enum import Enum
 import json
 from bson import ObjectId
 
+from llama_index.agent.openai import OpenAIAgent
+import nest_asyncio
+import gradio as gr
+
+nest_asyncio.apply()
+
+
 class FlightSchema(BaseModel):
     start_time:Optional[str] = None
     end_time:Optional[str] = None
@@ -45,20 +56,6 @@ class FlightSchema(BaseModel):
     departure_airport:Optional[str] = None
     arrival_airport:Optional[str] = None
     airline:Optional[str] = None
-
-'''
-schema = StructType([
-        StructField("departure_time", StringType(), True),
-        StructField("flight_id", StringType(), True),
-        StructField("counter", StringType(), True),
-        StructField("gate", StringType(), True),
-        StructField("departure_region_name", StringType(), True),
-        StructField("arrival_region_name", StringType(), True),
-        StructField("departure_airport", StringType(), True),
-        StructField("arrival_airport", StringType(), True),
-        StructField("airline", StringType(), True)
-    ])
-'''
 
 class BookingSchema(BaseModel):
     user_name: str
@@ -102,9 +99,7 @@ class MongoEncoder(json.JSONEncoder):
         if isinstance(obj, ObjectId):
             return str(obj)
         return super().default(obj)
-from elasticsearch import Elasticsearch
-from qdrant_client import QdrantClient
-from llama_index.embeddings.openai import OpenAIEmbedding
+
 
 #from sentence_transformers import CrossEncoder
 
@@ -612,50 +607,49 @@ async def retrieve_regulation(user_query: str) -> str:
     RAGdata = await query_regulation(query=user_query)
     return RAGdata
 
-from llama_index.agent.openai import OpenAIAgent
-import nest_asyncio
-nest_asyncio.apply()
 
+
+# Define the MongoDB Retriever tool
+read_mongodb_tool = FunctionTool.from_defaults(
+    async_fn=read_mongodb,
+    name='MongoDB_Retriever',
+    description=(
+        'Tool to retrieve information from the MongoDB database. This tool is used after got a valid MongoDB query.'
+    )
+)
+
+RAG_regulation_tool = FunctionTool.from_defaults(
+    async_fn=retrieve_regulation,
+    name='RegulationRAG_tool',
+    description=(
+        'Tool to retrive general regulations for Air Travel. No need to change user query'
+    )
+)
+
+booking_submit_tool = FunctionTool.from_defaults(
+    async_fn=submit_booking,
+    name="SubmitBooking_Tool",
+    description=(
+        'Tool to submit booking information to MongoDB database. This tool is used to after got a valid MongoDB query.'
+    )
+)
+
+# Define the Query Preparation tool
+prepare_input_tool = FunctionTool.from_defaults(
+    async_fn=prepare_input,
+    name='Query_Prep',
+    description=(
+        'Tool to generate a Query from user input. Ensure user input is complete and accurate before invoking this tool.'
+    )
+)
 async def main():
-    # Define the MongoDB Retriever tool
-    read_mongodb_tool = FunctionTool.from_defaults(
-        async_fn=read_mongodb,
-        name='MongoDB_Retriever',
-        description=(
-            'Tool to retrieve information from the MongoDB database. This tool is used after got a valid MongoDB query.'
-        )
-    )
-
-    RAG_regulation_tool = FunctionTool.from_defaults(
-        async_fn=retrieve_regulation,
-        name='RegulationRAG_tool',
-        description=(
-            'Tool to retrive general regulations for Air Travel. No need to change user query'
-        )
-    )
-
-    booking_submit_tool = FunctionTool.from_defaults(
-        async_fn=submit_booking,
-        name="SubmitBooking_Tool",
-        description=(
-            'Tool to submit booking information to MongoDB database. This tool is used to after got a valid MongoDB query.'
-        )
-    )
-
-    # Define the Query Preparation tool
-    prepare_input_tool = FunctionTool.from_defaults(
-        async_fn=prepare_input,
-        name='Query_Prep',
-        description=(
-            'Tool to generate a Query from user input. Ensure user input is complete and accurate before invoking this tool.'
-        )
-    )
-
+    
+#################################################################################################
     tools = [prepare_input_tool, read_mongodb_tool, booking_submit_tool, RAG_regulation_tool]
 
     # Initialize the OpenAI language model
     llm = OpenAI(
-        model='gpt-3.5-turbo',
+        model='gpt-4o-mini',
         logprobs=None,  # Thêm tham số này
         default_headers={},  # Thêm tham số này
     )
@@ -683,7 +677,44 @@ async def main():
         print("\nExiting. Goodbye!")
     except Exception as e:
         print(f"An error occurred: {e}")
-    
+
+async def process_query(message: str, 
+                       history: List[Dict], 
+                       agent: OpenAIAgent) -> tuple[str, List[Dict]]:
+    try:
+        response = await agent.achat(message)
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": str(response)})
+        return "", history
+    except Exception as e:
+        error_msg = f"Error processing query: {str(e)}"
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": error_msg})
+        return "", history
+
+def create_interface(tools: List[FunctionTool], system_prompt: str):
+    llm = OpenAI(model='gpt-4o-mini', logprobs=None, default_headers={})
+    agent = OpenAIAgent.from_tools(tools, llm=llm, verbose=True, system_prompt=system_prompt)
+
+    with gr.Blocks() as interface:
+        chatbot = gr.Chatbot(label="Flight Assistant Chat", type="messages")
+        msg = gr.Textbox(label="Type your message here", placeholder="Ask about flights...")
+        clear = gr.Button("Clear Chat")
+
+        async def respond(message, chat_history):
+            if not message.strip():
+                return "", chat_history
+            return await process_query(message, chat_history, agent)
+
+        msg.submit(fn=respond, inputs=[msg, chatbot], outputs=[msg, chatbot])
+        clear.click(lambda: [], None, chatbot, queue=False)
+
+    return interface
+
 if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
+    tools = [prepare_input_tool, read_mongodb_tool, booking_submit_tool, RAG_regulation_tool]
+    interface = create_interface(tools, prompts.SYSTEM_PROMPT)
+    interface.launch(share=False, server_port=7860)
+
+#import asyncio
+#asyncio.run(main())
